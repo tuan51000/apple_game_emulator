@@ -92,7 +92,37 @@ pub const CLASSES: ClassExports = objc_classes! {
     assert!(host_obj.current_key.is_none());
     assert!(host_obj.plist.is_empty());
 
-    let plist = Value::from_reader(Cursor::new(slice)).unwrap();
+    let plist = if super::nib_archive::is_nib_archive(slice) {
+        log!("NSKeyedUnarchiver: detected NIBArchive format, \
+              converting to NSKeyedArchiver plist");
+        let dict = super::nib_archive::parse_nib_archive(slice);
+        Value::Dictionary(dict)
+    } else {
+        match Value::from_reader(Cursor::new(slice)) {
+        Ok(v) => v,
+        Err(e) => {
+            log!(
+                "NSKeyedUnarchiver: plist parse failed: {:?}, \
+                 data length={}, first 200 bytes={:?}",
+                e,
+                slice.len(),
+                &slice[..std::cmp::min(200, slice.len())]
+            );
+            let decoded: String = slice.iter().map(|&b| b as char).collect();
+            match Value::from_reader(Cursor::new(decoded.as_bytes())) {
+                Ok(v) => {
+                    log!("NSKeyedUnarchiver: Latin-1 fallback succeeded");
+                    v
+                }
+                Err(e2) => {
+                    panic!(
+                        "NSKeyedUnarchiver: Latin-1 fallback also failed: {:?}",
+                        e2
+                    );
+                }
+            }
+        }
+    }};
     let plist = plist.into_dictionary().unwrap();
     assert!(plist["$version"].as_unsigned_integer() == Some(100000));
     assert!(plist["$archiver"].as_string() == Some("NSKeyedArchiver"));
