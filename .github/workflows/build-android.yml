@@ -1,0 +1,77 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Download Boost
+      run: |
+        curl -L -o boost.7z "https://archives.boost.io/release/1.87.0/source/boost_1_87_0.7z"
+        7z -ovendor x boost.7z
+        mv vendor/boost_1_87_0 vendor/boost
+
+    - name: Download SQLite3 amalgamation
+      run: |
+        curl -L -o sqlite.zip "https://www.sqlite.org/2024/sqlite-amalgamation-3450100.zip"
+        unzip sqlite.zip
+        mkdir -p vendor/sqlite3
+        cp sqlite-amalgamation-3450100/sqlite3.c vendor/sqlite3/
+        cp sqlite-amalgamation-3450100/sqlite3.h vendor/sqlite3/
+
+    - name: Install CMake 3.31
+      run: |
+        curl -L -O "https://github.com/Kitware/CMake/releases/download/v3.31.6/cmake-3.31.6-linux-x86_64.tar.gz"
+        tar xzf cmake-3.31.6-linux-x86_64.tar.gz -C vendor
+        mv vendor/cmake-3.31.6-linux-x86_64 vendor/cmake
+
+    - name: Install AArch64 Android Rust toolchain
+      run: rustup target add aarch64-linux-android
+
+    - name: Install cargo-ndk
+      run: cargo install cargo-ndk@3.5.4
+
+    - name: Download Gradle
+      run: |
+        curl -L -o gradle.zip "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
+        7z -ogradle x gradle.zip
+
+    - name: Download Android NDK
+      run: |
+        curl -L -o ndk.zip "https://dl.google.com/android/repository/android-ndk-r25c-linux.zip"
+        7z -oandroid-ndk -snld x ndk.zip
+
+    - name: Link Android NDK
+      run: ln -s $PWD'/android-ndk/android-ndk-r25c' $ANDROID_SDK_ROOT'/ndk/25.2.9519653'
+
+    - name: Generate local.properties
+      run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
+
+    - name: Build Android APK
+      run: |
+        cd android
+        ../gradle/gradle-8.11.1/bin/gradle assembleRelease
+        mv app/build/outputs/apk/release/app-release.apk ../touchHLE.apk
+      env:
+        ANDROID_NDK_ROOT: '/usr/local/lib/android/sdk/ndk/25.2.9519653'
+        CMAKE: ${{ github.workspace }}/vendor/cmake/bin/cmake
+
+    - name: Upload APK
+      uses: actions/upload-artifact@v4
+      with:
+        name: touchHLE_Android
+        path: touchHLE.apk
