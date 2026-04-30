@@ -129,6 +129,14 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let key_count = plist["$objects"].as_array().unwrap().len();
 
+    // Debug: log $top keys
+    if let Some(top) = plist.get("$top") {
+        if let Some(top_dict) = top.as_dictionary() {
+            let top_keys: Vec<&String> = top_dict.keys().collect();
+            log!("NSKeyedUnarchiver: $top keys = {:?}", top_keys);
+        }
+    }
+
     host_obj.already_unarchived = vec![None; key_count];
     host_obj.plist = plist;
 
@@ -166,42 +174,62 @@ pub const CLASSES: ClassExports = objc_classes! {
 
 - (bool)decodeBoolForKey:(id)key { // NSString *
     get_value_to_decode_for_key(env, this, key)
-        .is_some_and(|value| value.as_boolean().unwrap())
+        .is_some_and(|value| {
+            if let Some(b) = value.as_boolean() {
+                b
+            } else if let Some(i) = value.as_signed_integer() {
+                i != 0
+            } else {
+                false
+            }
+        })
 }
 
 - (f64)decodeDoubleForKey:(id)key { // NSString *
     get_value_to_decode_for_key(env, this, key).map_or(
         0.0,
-        |value| value.as_real().unwrap()
+        |value| {
+            value.as_real()
+                .or_else(|| value.as_signed_integer().map(|i| i as f64))
+                .unwrap_or(0.0)
+        }
     )
 }
 
 - (f32)decodeFloatForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
     get_value_to_decode_for_key(env, this, key).map_or(
         0.0,
-        |value| value.as_real().unwrap()
+        |value| {
+            value.as_real()
+                .or_else(|| value.as_signed_integer().map(|i| i as f64))
+                .unwrap_or(0.0)
+        }
     ) as f32
 }
 
 - (NSInteger)decodeIntegerForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
     get_value_to_decode_for_key(env, this, key).map_or(
         0,
-        |value| value.as_signed_integer().unwrap()
+        |value| {
+            value.as_signed_integer()
+                .or_else(|| value.as_boolean().map(|b| b as i64))
+                .unwrap_or(0)
+        }
     ).try_into().unwrap()
 }
 
 - (i32)decodeIntForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
     get_value_to_decode_for_key(env, this, key).map_or(
         0,
-        |value| value.as_signed_integer().unwrap()
+        |value| {
+            value.as_signed_integer()
+                .or_else(|| value.as_boolean().map(|b| b as i64))
+                .unwrap_or(0)
+        }
     ).try_into().unwrap()
 }
 
 - (i32)decodeInt32ForKey:(id)key { // NSString *
-    // TODO: Check bounds, raise NSRangeException if it doesn't fit
     get_value_to_decode_for_key(env, this, key).map_or(
         0,
         |value| value.as_signed_integer().unwrap()
@@ -219,7 +247,11 @@ pub const CLASSES: ClassExports = objc_classes! {
     let Some(next_uid) = get_value_to_decode_for_key(env, this, key) else {
         return nil;
     };
-    let next_uid = next_uid.as_uid().copied().unwrap();
+    let Some(next_uid) = next_uid.as_uid().copied() else {
+        // Value exists but isn't a UID reference (e.g. inline
+        // boolean/integer from NIBArchive). Not an object.
+        return nil;
+    };
     let object = unarchive_key(env, this, next_uid);
 
     // on behalf of the caller
@@ -259,15 +291,34 @@ fn borrow_host_obj(env: &mut Environment, unarchiver: id) -> &mut NSKeyedUnarchi
 fn get_value_to_decode_for_key(env: &mut Environment, unarchiver: id, key: id) -> Option<&Value> {
     let key = to_rust_string(env, key); // TODO: avoid copying string
     let host_obj = borrow_host_obj(env, unarchiver);
-    let scope = match host_obj.current_key {
+    let scope_value = match host_obj.current_key {
         Some(current_uid) => {
             &host_obj.plist["$objects"].as_array().unwrap()[current_uid.get() as usize]
         }
         None => &host_obj.plist["$top"],
+    };
+    let scope = match scope_value.as_dictionary() {
+        Some(d) => d,
+        None => {
+            log!(
+                "NSKeyedUnarchiver: get_value_to_decode_for_key({:?}) \
+                 scope is not a dictionary: {:?}",
+                key,
+                scope_value
+            );
+            return None;
+        }
+    };
+    let result = scope.get(&key);
+    if result.is_none() {
+        log!(
+            "NSKeyedUnarchiver: key {:?} not found in scope, \
+             available keys: {:?}",
+            key,
+            scope.keys().collect::<Vec<_>>()
+        );
     }
-    .as_dictionary()
-    .unwrap();
-    scope.get(&key)
+    result
 }
 
 /// The core of the implementation: unarchive something by its uid.
@@ -303,10 +354,11 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
                 let class_name = class_dict["$classname"].as_string().unwrap();
 
                 class = {
-                    // get_known_class needs &mut ObjC, so we can't call it
-                    // while holding a reference to the class name, since it
-                    // is ultimately owned by ObjC via the host object
                     let class_name = class_name.to_string();
+                    log!(
+                        "NSKeyedUnarchiver: instantiating class {:?}",
+                        class_name
+                    );
                     env.objc.get_known_class(&class_name, &mut env.mem)
                 };
                 let host_obj = borrow_host_obj(env, unarchiver); // reborrow
@@ -319,6 +371,21 @@ fn unarchive_key(env: &mut Environment, unarchiver: id, key: Uid) -> id {
             host_obj.current_key = Some(key);
 
             let new_object: id = msg![env; class alloc];
+            log!(
+                "NSKeyedUnarchiver: about to call initWithCoder \
+                 on object {:?} of class at {:?}, uid={:?}, \
+                 scope keys={:?}",
+                new_object,
+                class,
+                key,
+                {
+                    let ho = borrow_host_obj(env, unarchiver);
+                    let objs = ho.plist["$objects"].as_array().unwrap();
+                    objs[key.get() as usize]
+                        .as_dictionary()
+                        .map(|d| d.keys().cloned().collect::<Vec<_>>())
+                }
+            );
             let new_object: id = msg![env; new_object initWithCoder:unarchiver];
 
             let host_obj = borrow_host_obj(env, unarchiver); // reborrow

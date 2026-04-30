@@ -112,7 +112,9 @@ fn parse_keys(data: &[u8], header: &NibHeader) -> Vec<String> {
     let mut keys = Vec::with_capacity(header.key_count as usize);
     for _ in 0..header.key_count {
         let length = read_varint(data, &mut pos) as usize;
-        let s = String::from_utf8_lossy(&data[pos..pos + length]).into_owned();
+        let raw = &data[pos..pos + length];
+        let trimmed = raw.strip_suffix(&[0]).unwrap_or(raw);
+        let s = String::from_utf8_lossy(trimmed).into_owned();
         pos += length;
         keys.push(s);
     }
@@ -126,8 +128,9 @@ fn parse_class_names(data: &[u8], header: &NibHeader) -> Vec<String> {
         let name_length = read_varint(data, &mut pos) as usize;
         let fallback_count = read_varint(data, &mut pos) as usize;
         pos += fallback_count * 4;
-        let name =
-            String::from_utf8_lossy(&data[pos..pos + name_length]).into_owned();
+        let raw = &data[pos..pos + name_length];
+        let trimmed = raw.strip_suffix(&[0]).unwrap_or(raw);
+        let name = String::from_utf8_lossy(trimmed).into_owned();
         pos += name_length;
         classes.push(name);
     }
@@ -277,6 +280,47 @@ pub fn parse_nib_archive(data: &[u8]) -> Dictionary {
         let class_name = &class_names[obj.class_index as usize];
         let plist_idx = obj_index_map[&(i as u32)] as usize;
 
+        let val_start = obj.values_index as usize;
+        let val_end = val_start + obj.values_count as usize;
+
+        // NSString/NSMutableString: store as plain Value::String
+        // instead of a dictionary, since NSKeyedUnarchiver handles
+        // strings directly without initWithCoder:.
+        if class_name == "NSString" || class_name == "NSMutableString" {
+            let mut string_val = String::new();
+            for val in &all_values[val_start..val_end] {
+                let key_name = &keys[val.key_index as usize];
+                if key_name == "NS.bytes" || key_name == "UINibEncoderEmptyKey"
+                {
+                    if let NibPayload::Data(d) = &val.payload {
+                        string_val =
+                            String::from_utf8_lossy(d).into_owned();
+                        // Strip trailing null
+                        string_val =
+                            string_val.trim_end_matches('\0').to_string();
+                    }
+                }
+            }
+            plist_objects[plist_idx] = Value::String(string_val);
+            continue;
+        }
+
+        // NSData/NSMutableData: store as plain Value::Data
+        if class_name == "NSData" || class_name == "NSMutableData" {
+            let mut data_val = Vec::new();
+            for val in &all_values[val_start..val_end] {
+                let key_name = &keys[val.key_index as usize];
+                if key_name == "NS.bytes" || key_name == "UINibEncoderEmptyKey"
+                {
+                    if let NibPayload::Data(d) = &val.payload {
+                        data_val = d.clone();
+                    }
+                }
+            }
+            plist_objects[plist_idx] = Value::Data(data_val);
+            continue;
+        }
+
         // Build the $class entry (append at end of $objects)
         let class_plist_idx = plist_objects.len() as u64;
         let mut class_dict = Dictionary::new();
@@ -300,9 +344,6 @@ pub fn parse_nib_archive(data: &[u8]) -> Dictionary {
             Value::Uid(Uid::new(class_plist_idx)),
         );
 
-        let val_start = obj.values_index as usize;
-        let val_end = val_start + obj.values_count as usize;
-
         // Track repeated keys for NSArray inlining
         let mut key_counts: HashMap<u32, usize> = HashMap::new();
         for val in &all_values[val_start..val_end] {
@@ -323,6 +364,46 @@ pub fn parse_nib_archive(data: &[u8]) -> Dictionary {
                         Value::Uid(Uid::new(0))
                     }
                 }
+                // Convert inline geometry data to string format
+                // stored in $objects and referenced by UID, matching
+                // what decodeCGRectForKey / decodeCGPointForKey expect.
+                NibPayload::Data(d) if d.len() == 16 && matches!(
+                    key_name.as_str(),
+                    "UIBounds" | "UIFrame" | "UIFrameX"
+                    | "UIAutoresizeToFitContentFrame"
+                ) => {
+                    let x = read_f32_le(d, 0);
+                    let y = read_f32_le(d, 4);
+                    let w = read_f32_le(d, 8);
+                    let h = read_f32_le(d, 12);
+                    let s = format!("{{{{{x}, {y}}}, {{{w}, {h}}}}}");
+                    let idx = plist_objects.len() as u64;
+                    plist_objects.push(Value::String(s));
+                    Value::Uid(Uid::new(idx))
+                }
+                NibPayload::Data(d) if d.len() == 8 && matches!(
+                    key_name.as_str(),
+                    "UICenter" | "UIContentOffset"
+                ) => {
+                    let x = read_f32_le(d, 0);
+                    let y = read_f32_le(d, 4);
+                    let s = format!("{{{x}, {y}}}");
+                    let idx = plist_objects.len() as u64;
+                    plist_objects.push(Value::String(s));
+                    Value::Uid(Uid::new(idx))
+                }
+                NibPayload::Data(d) if d.len() == 8 && matches!(
+                    key_name.as_str(),
+                    "UIContentSize" | "UIScrollViewContentSize"
+                    | "UIMinimumSize" | "UIMaximumSize"
+                ) => {
+                    let w = read_f32_le(d, 0);
+                    let h = read_f32_le(d, 4);
+                    let s = format!("{{{w}, {h}}}");
+                    let idx = plist_objects.len() as u64;
+                    plist_objects.push(Value::String(s));
+                    Value::Uid(Uid::new(idx))
+                }
                 other => payload_to_plist(other),
             };
 
@@ -337,22 +418,49 @@ pub fn parse_nib_archive(data: &[u8]) -> Dictionary {
             }
         }
 
-        // Insert collected arrays
+        // Insert collected arrays.
+        // For NSArray/NSMutableArray/NSDictionary/NSMutableDictionary,
+        // NIBArchive uses "UINibEncoderEmptyKey" for elements, but
+        // NSKeyedArchiver uses "NS.objects" (and "NS.keys" for dicts).
+        let is_array = class_name == "NSArray"
+            || class_name == "NSMutableArray";
+        let is_dict = class_name == "NSDictionary"
+            || class_name == "NSMutableDictionary";
+
         for (key_idx, arr) in array_values {
             let key_name = &keys[key_idx as usize];
-            obj_dict.insert(key_name.clone(), Value::Array(arr));
+            if (is_array || is_dict) && key_name == "UINibEncoderEmptyKey" {
+                obj_dict.insert("NS.objects".to_string(), Value::Array(arr));
+            } else {
+                obj_dict.insert(key_name.clone(), Value::Array(arr));
+            }
         }
 
         plist_objects[plist_idx] = Value::Dictionary(obj_dict);
     }
 
-    // Build the $top dictionary — the root object is index 0
-    // (maps to plist index 1)
+    // Build the $top dictionary from the root object (object 0).
+    // In NSKeyedArchiver nibs, the top-level keys (UINibObjectsKey,
+    // UINibConnectionsKey, etc.) live directly in $top. The root
+    // NIBArchive object's values become $top entries.
     let mut top = Dictionary::new();
-    top.insert(
-        "root".to_string(),
-        Value::Uid(Uid::new(*obj_index_map.get(&0).unwrap_or(&1))),
-    );
+    let root_obj = &objects[0];
+    let root_start = root_obj.values_index as usize;
+    let root_end = root_start + root_obj.values_count as usize;
+    for val in &all_values[root_start..root_end] {
+        let key_name = &keys[val.key_index as usize];
+        let plist_val = match &val.payload {
+            NibPayload::ObjectRef(idx) => {
+                if let Some(&mapped) = obj_index_map.get(idx) {
+                    Value::Uid(Uid::new(mapped))
+                } else {
+                    Value::Uid(Uid::new(0))
+                }
+            }
+            other => payload_to_plist(other),
+        };
+        top.insert(key_name.clone(), plist_val);
+    }
 
     // Build the wrapper
     let mut root = Dictionary::new();

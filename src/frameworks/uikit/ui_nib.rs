@@ -164,11 +164,29 @@ pub const CLASSES: ClassExports = objc_classes! {
 
     let name_key = get_static_str(env, "UIClassName");
     let name_nss: id = msg![env; coder decodeObjectForKey:name_key];
+    log!(
+        "UIClassSwapper: UIClassName={:?}, nil={}",
+        if name_nss != nil { to_rust_string(env, name_nss).to_string() } else { "(nil)".into() },
+        name_nss == nil
+    );
+    if name_nss == nil {
+        release(env, this);
+        return nil;
+    }
     let name = to_rust_string(env, name_nss);
 
     let orig_key = get_static_str(env, "UIOriginalClassName");
     let orig_nss: id = msg![env; coder decodeObjectForKey:orig_key];
-    let orig = to_rust_string(env, orig_nss);
+    let orig = if orig_nss != nil {
+        to_rust_string(env, orig_nss).to_string()
+    } else {
+        String::new()
+    };
+    log!(
+        "UIClassSwapper: name={:?}, orig={:?}",
+        name.to_string(),
+        orig
+    );
 
     let class = env.objc.get_known_class(&name, &mut env.mem);
 
@@ -176,8 +194,10 @@ pub const CLASSES: ClassExports = objc_classes! {
     let object: id = if orig == "UICustomObject" {
         msg![env; object init]
     } else {
+        log!("UIClassSwapper: calling initWithCoder on {:?}", name.to_string());
         msg![env; object initWithCoder:coder]
     };
+    log!("UIClassSwapper: done, object={:?}", object);
     release(env, this);
     // TODO: autorelease the object?
     object
