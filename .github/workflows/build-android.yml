@@ -61,6 +61,34 @@ jobs:
     - name: Generate local.properties
       run: echo 'sdk.dir='$ANDROID_SDK_ROOT > android/local.properties
 
+    - name: Bundle assets into Android project
+      run: |
+        ASSETS_DIR=android/app/src/main/assets
+
+        # Replace placeholder files with real directories/files
+        rm -f "$ASSETS_DIR/touchHLE_dylibs"
+        rm -f "$ASSETS_DIR/touchHLE_fonts"
+        rm -f "$ASSETS_DIR/touchHLE_default_options.txt"
+
+        # Copy dylibs
+        mkdir -p "$ASSETS_DIR/touchHLE_dylibs"
+        cp touchHLE_dylibs/*.dylib "$ASSETS_DIR/touchHLE_dylibs/"
+        cp touchHLE_dylibs/COPYING.* "$ASSETS_DIR/touchHLE_dylibs/" || true
+        cp touchHLE_dylibs/README.md "$ASSETS_DIR/touchHLE_dylibs/" || true
+
+        # Copy fonts
+        mkdir -p "$ASSETS_DIR/touchHLE_fonts"
+        cp touchHLE_fonts/*.ttf "$ASSETS_DIR/touchHLE_fonts/"
+        cp touchHLE_fonts/*.otf "$ASSETS_DIR/touchHLE_fonts/"
+        cp touchHLE_fonts/LICENSE.* "$ASSETS_DIR/touchHLE_fonts/" || true
+        cp touchHLE_fonts/README.md "$ASSETS_DIR/touchHLE_fonts/" || true
+
+        # Copy default options
+        cp touchHLE_default_options.txt "$ASSETS_DIR/touchHLE_default_options.txt"
+
+        echo "Assets bundled:"
+        find "$ASSETS_DIR" -type f | sort
+
     - name: Build Android APK
       run: |
         cd android
